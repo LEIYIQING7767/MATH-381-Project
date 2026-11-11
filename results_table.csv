@@ -1,0 +1,16 @@
+﻿Measure,Result,How to read it
+Cohort size,32,Each student takes one course in each of the five slots.
+S assignments,63/160 (39.4%),Share of seats rated strongly preferred by their assigned student.
+L assignments,82/160 (51.2%),Share of seats rated liked by their assigned student.
+Blank assignments,15/160 (9.4%),Share of seats with a neutral survey rating.
+Best rating in slot,159/160 (99.4%),Assigned rating matched the best rating in that slot after exclusions and locks.
+Gender imbalance,10,Sum of squared differences between M and F counts across classes. Lower is better.
+Courses with topic tags,4/18 (22.2%),Topic statistics cover the supplied and overridden tags.
+Topic repeats,10,Each tagged course after the first in the same topic adds one repeat.
+Largest same-topic count,2,Largest tagged-topic count for one student. The cap is 3.
+Mean distinct instructors,4.22,"Average per student, out of five."
+Unique student schedules,32/32 (100.0%),Every student has a distinct set of five courses.
+Classes in ideal size band,3/18 (16.7%),Ideal is the floor or ceiling of cohort size divided by courses in the slot.
+Class size range,3–16,Smallest and largest classes across all five slots.
+Class size penalty,48,Total seats above or below the ideal bands. Lower is better.
+Priority tiers proven optimal,4/5,Proof includes all higher tiers. See objective_scores.csv for bounds.

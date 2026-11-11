@@ -1,0 +1,6 @@
+﻿objective,direction,value,bound_at_fixed_higher_scores,status,proved_at_all_higher_optima,seconds,weight in equivalent objective
+satisfaction,maximize,10225,10225,OPTIMAL,True,1.514,"S=2211120472491, L=13733667531"
+gender_penalty,minimize,10,10,OPTIMAL,True,1.079,-5341761
+topic_repeats,minimize,10,10,OPTIMAL,True,10.68,-41409
+instructor_repeats,minimize,25,25,OPTIMAL,True,15.516,-321
+size_penalty,minimize,48,24,FEASIBLE,False,20.048,-1
