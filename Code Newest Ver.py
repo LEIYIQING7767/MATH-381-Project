@@ -28,6 +28,41 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import cache
 from itertools import combinations
+#!/usr/bin/env python3
+"""Build course times and student schedules for the MathILy-Er camp.
+
+Run these commands from the folder with this script and the survey.
+
+    python -m pip install ortools==9.15.6755
+    python mathily_er_scheduler_beginner.py survey.txt --out results
+    python mathily_er_scheduler_beginner.py survey.txt --out results_w --method weighted
+
+The goals can be combined two ways. Cascade improves one goal at a time, so
+a higher goal always wins. Weighted adds all the goals into one score, using
+GOAL_WEIGHTS and WEIGHT_MULTIPLIER near the top of this file.
+
+The survey has one column per course. The first three rows give the
+instructor, class name, and topic. Every other row gives a student's
+ratings. S means strongly preferred, L means liked, blank means
+acceptable, and X means the student cannot take the course.
+
+Open START_HERE.txt for a summary. The two CSV files show the schedule
+by student and by course. Choose a new output folder for each run.
+
+If you are reading the code for the first time, start at main() at the
+bottom. It follows the same order as a run.
+"""
+
+import argparse
+import csv
+import math
+import os
+import re
+import tempfile
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from functools import cache
+from itertools import combinations
 from pathlib import Path
 from time import perf_counter
 
@@ -43,6 +78,32 @@ except ImportError:
 SLOT_SIZES = (4, 4, 4, 3, 3)
 MAX_SAME_TOPIC = 3  # A student can take at most this many courses in one known topic.
 MAX_CLASS_SIZE = None  # With None, a class can have up to the total number of students.
+
+# How the five goals are combined. You can also choose with --method.
+#   "cascade"  improves one goal at a time, in the order they appear in make_scores.
+#              A higher goal always wins. GOAL_WEIGHTS and WEIGHT_MULTIPLIER are not used.
+#   "weighted" adds all five goals into one score and maximizes it, so goals can trade off.
+SOLVE_METHOD = "cascade"
+
+# Weighted method only. A bigger number means a more important goal. Only the
+# ratios matter, so 4:2:1.5:1:1.5 gives the same schedule as 0.4:0.2:0.15:0.1:0.15.
+# Use the exact goal names from make_scores.
+GOAL_WEIGHTS = {
+    "Student preferences": 0.40,
+    "Gender balance": 0.25,
+    "Topic variety": 0.15,
+    "Instructor variety": 0.10,
+    "Class sizes": 0.10,
+}
+# Weighted method only. CP-SAT needs whole numbers, so each goal's coefficient is
+# round(WEIGHT_MULTIPLIER * weight / the goal's largest possible value).
+# A bigger multiplier means less rounding error. The run prints the rounded shares.
+WEIGHT_MULTIPLIER = 10**9
+
+# Points for one S and one L in the preference goal. None for S means total seats + 1,
+# so one S beats any number of Ls. The cascade method needs this default.
+S_POINTS = None
+L_POINTS = 1
 
 # Use the exact course names from the survey. Remove # to use an example line.
 TOPIC_OVERRIDES = {
@@ -295,9 +356,10 @@ def make_scores(model, courses, students, slot_sizes, takes_course, course_at,
                          if students[s].ratings[c] == "S")
     liked_choices = sum(takes_course[s][c] for s in student_ids for c in course_ids
                         if students[s].ratings[c] == "L")
-    # With 160 seats, one S is worth 161 points and one L is worth 1.
+    # By default, with 160 seats, one S is worth 161 points and one L is worth 1.
     # This keeps a single extra S ahead of any possible gain in L.
-    preference_score = (total_seats + 1) * strong_choices + liked_choices
+    s_points, l_points = preference_points(total_seats)
+    preference_score = s_points * strong_choices + l_points * liked_choices
 
     group_f = [s for s in student_ids if students[s].gender == "F"]
     group_m = [s for s in student_ids if students[s].gender == "M"]
@@ -363,6 +425,89 @@ def make_scores(model, courses, students, slot_sizes, takes_course, course_at,
         ("Class sizes", sum(size_scores), False),
     ]
     return strong_choices, liked_choices, goals
+
+
+# 4b. Weights and scales. The cascade method uses preference_points and new_solver.
+# The weighted method uses all of these.
+
+def preference_points(total_seats):
+    """Points for one S and one L, from the settings at the top."""
+    s_points = total_seats + 1 if S_POINTS is None else S_POINTS
+    return s_points, L_POINTS
+
+
+def new_solver(seconds, workers, seed):
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = seconds
+    solver.parameters.num_workers = workers
+    solver.parameters.random_seed = seed
+    return solver
+
+
+def goal_ranges(students, slot_sizes):
+    """The largest value each goal can reach. Every goal's smallest value is 0.
+
+    These are safe worst cases, not values a real schedule would get.
+    """
+    n = len(students)
+    slots = len(slot_sizes)
+    seats = n * slots
+    n_f = sum(student.gender == "F" for student in students)
+    n_m = sum(student.gender == "M" for student in students)
+    s_points, l_points = preference_points(seats)
+
+    # Worst class sizes: every student in one course of each slot. That course is
+    # over its ideal range and the others are under it.
+    size_worst = 0
+    for courses_in_slot in slot_sizes:
+        low, high = n // courses_in_slot, math.ceil(n / courses_in_slot)
+        size_worst += (n - high) + (courses_in_slot - 1) * low
+
+    return {
+        "Student preferences": max(s_points, l_points) * seats,
+        "Gender balance": slots * (n_f ** 2 + n_m ** 2),
+        "Topic variety": n * (slots - 1),
+        "Instructor variety": n * (slots - 1),
+        "Class sizes": size_worst,
+    }
+
+
+def integer_coefficients(goals, ranges, weights, multiplier):
+    """Turn each weight into a whole number: round(multiplier * weight / range)."""
+    if set(weights) != {name for name, _, _ in goals} or any(w <= 0 for w in weights.values()):
+        raise ValueError("GOAL_WEIGHTS must list every goal once, each with a positive weight.")
+    if type(multiplier) is not int or multiplier < 1:
+        raise ValueError("WEIGHT_MULTIPLIER must be a whole number of at least 1.")
+    coefficients = {}
+    for name, _, _ in goals:
+        if ranges[name] == 0:
+            coefficients[name] = 0  # This goal cannot change, so it needs no weight.
+            continue
+        coefficient = round(multiplier * weights[name] / ranges[name])
+        if coefficient < 1:
+            raise ValueError(f"The weight for {name!r} rounds to 0. Raise WEIGHT_MULTIPLIER.")
+        coefficients[name] = coefficient
+    return coefficients
+
+
+def weighted_objective(goals, coefficients):
+    """One score to maximize. Rewards add to it and penalties subtract from it."""
+    return sum(
+        (1 if higher_is_better else -1) * coefficients[name] * score
+        for name, score, higher_is_better in goals
+    )
+
+
+def describe_coefficients(goals, ranges, coefficients):
+    """Show each goal's intended share of the weight and its share after rounding."""
+    intended_total = sum(GOAL_WEIGHTS.values())
+    rounded_total = sum(coefficients[name] * ranges[name] for name, _, _ in goals)
+    lines = ["Weight share of each goal: intended -> after rounding (integer coefficient)"]
+    for name, _, _ in goals:
+        intended = GOAL_WEIGHTS[name] / intended_total
+        rounded = coefficients[name] * ranges[name] / rounded_total
+        lines.append(f"  {name}: {intended:.1%} -> {rounded:.1%} (coefficient {coefficients[name]})")
+    return lines
 
 
 # 5. Once we know the preference score to keep, skip timetables that cannot reach it.
@@ -453,9 +598,11 @@ def narrow_timetable_search(built, courses, students, slot_sizes, score_to_keep,
     print(f"  {len(timetables)} course timetables pass the preference score check.", flush=True)
 
 
-# 6. Improve one goal at a time and keep the score before moving on.
+# 6. Two ways to search.
+# solve_cascade improves one goal at a time and keeps the score before moving on.
 # We want better class sizes only if we can keep the earlier scores,
 # including the counts of students' preferred courses.
+# solve_weighted adds all the goals into one score and searches once.
 
 @dataclass(frozen=True)
 class SearchRound:
@@ -468,7 +615,7 @@ class SearchRound:
     seconds: float
 
 
-def solve_in_priority_order(built, courses, students, slot_sizes, locks, seconds, workers, seed):
+def solve_cascade(built, courses, students, slot_sizes, locks, seconds, workers, seed):
     """Use the best schedule we have after each round as the next starting point."""
     model = built.model
     best = None
@@ -483,10 +630,7 @@ def solve_in_priority_order(built, courses, students, slot_sizes, locks, seconds
         else:
             model.minimize(score)
 
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = seconds
-        solver.parameters.num_workers = workers
-        solver.parameters.random_seed = seed
+        solver = new_solver(seconds, workers, seed)
         status = solver.solve(model)
         if status == cp_model.MODEL_INVALID:
             raise RuntimeError(f"The solver rejected the model. {model.validate() or solver.solution_info()}")
@@ -538,6 +682,31 @@ def solve_in_priority_order(built, courses, students, slot_sizes, locks, seconds
     return best, rounds
 
 
+def solve_weighted(built, coefficients, seconds, workers, seed):
+    """Maximize one combined score. Goals can trade off, so there is a single search."""
+    model = built.model
+    model.maximize(weighted_objective(built.goals, coefficients))
+    solver = new_solver(seconds, workers, seed)
+    status = solver.solve(model)
+    if status == cp_model.MODEL_INVALID:
+        raise RuntimeError(f"The solver rejected the model. {model.validate() or solver.solution_info()}")
+    if status == cp_model.INFEASIBLE:
+        raise ValueError("The solver proved no schedule can satisfy all the current rules.")
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise ValueError("No schedule was found in time. Try a larger --seconds-per-stage value.")
+
+    result = SearchRound(
+        "Weighted score", round(solver.objective_value), True,
+        round(solver.best_objective_bound), solver.status_name(status),
+        status == cp_model.OPTIMAL, solver.wall_time,
+    )
+    if status == cp_model.OPTIMAL:
+        print(f"  Combined score {result.score}. Proved best.", flush=True)
+    else:
+        print(f"  Combined score {result.score}. Best possible is at most {result.best_possible_bound}.", flush=True)
+    return solver, [result]
+
+
 # 7. Check the chosen schedule before writing any files.
 
 def check_schedule(courses, students, slot_sizes, locks, max_class_size, course_times, schedules):
@@ -579,7 +748,8 @@ def write_csv(path, headers, rows):
         writer.writerows(rows)
 
 
-def write_outputs(folder, args, courses, students, course_times, schedules, locks, rounds):
+def write_outputs(folder, args, courses, students, course_times, schedules, locks, rounds,
+                  goal_values, weight_lines):
     """Write one summary, one row per student, and one row per course."""
     student_count = len(students)
     slot_count = len(SLOT_SIZES)
@@ -702,38 +872,61 @@ def write_outputs(folder, args, courses, students, course_times, schedules, lock
         f"Classes in their ideal size range: {courses_in_ideal_range} of {len(courses)}",
         "The ideal range rounds the average class size in that slot down and up.",
         "",
-        "HOW EACH SEARCH ROUND DID",
-        f"Consecutive rounds proved best, starting with preferences: {proved_rounds} of {len(rounds)}.",
-        f"Preference points: S = {total_seats + 1}, L = 1, blank = 0.",
-        "Later rounds keep the scores already reached for earlier goals.",
-        "",
     ])
+    s_points, l_points = preference_points(total_seats)
     explanations = [
-        "More S choices first. More L choices break ties.",
+        "More S choices first. More L choices break ties." if weight_lines is None
+        else f"Each S choice earns {s_points} points and each L choice earns {l_points}.",
         "Add the squared F/M gap for each course. A gap of 2 costs 4 points.",
         "Every course after the first in the same known topic costs 1 point per student.",
         "Every course after the first with the same instructor costs 1 point per student.",
         "Each seat above or below a course's ideal size range costs 1 point.",
     ]
-    for number, (result, explanation) in enumerate(zip(rounds, explanations), start=1):
-        direction = "higher is better" if result.higher_is_better else "lower is better"
-        summary.extend([f"{number}. {result.name} ({direction})", f"   {explanation}"])
-        if result.proved_through_this_round:
-            detail = "Proved best."
-        elif result.status == "OPTIMAL":
-            detail = "Proved best for the earlier scores kept in this run."
-        elif result.best_possible_bound is None:
-            detail = "No new schedule found in time. Used the earlier schedule."
-        else:
-            low, high = sorted((result.score, result.best_possible_bound))
-            detail = f"Best possible score is between {low} and {high} with earlier scores fixed."
-        summary.extend([f"   Score kept: {result.score}. {detail} Search time: {result.seconds:.1f} s.", ""])
+    if weight_lines is None:
+        summary.extend([
+            "HOW EACH SEARCH ROUND DID",
+            f"Consecutive rounds proved best, starting with preferences: {proved_rounds} of {len(rounds)}.",
+            f"Preference points: S = {s_points}, L = {l_points}, blank = 0.",
+            "Later rounds keep the scores already reached for earlier goals.",
+            "",
+        ])
+        for number, (result, explanation) in enumerate(zip(rounds, explanations), start=1):
+            direction = "higher is better" if result.higher_is_better else "lower is better"
+            summary.extend([f"{number}. {result.name} ({direction})", f"   {explanation}"])
+            if result.proved_through_this_round:
+                detail = "Proved best."
+            elif result.status == "OPTIMAL":
+                detail = "Proved best for the earlier scores kept in this run."
+            elif result.best_possible_bound is None:
+                detail = "No new schedule found in time. Used the earlier schedule."
+            else:
+                low, high = sorted((result.score, result.best_possible_bound))
+                detail = f"Best possible score is between {low} and {high} with earlier scores fixed."
+            summary.extend([f"   Score kept: {result.score}. {detail} Search time: {result.seconds:.1f} s.", ""])
+    else:
+        result = rounds[0]
+        gap = (result.best_possible_bound - result.score) / result.best_possible_bound if result.best_possible_bound else 0
+        summary.extend([
+            "HOW THE WEIGHTED SEARCH DID",
+            f"Preference points: S = {s_points}, L = {l_points}, blank = 0.",
+            f"Combined score: {result.score} ({result.status}). Best possible: {result.best_possible_bound}. Gap: {gap:.2%}.",
+            f"Search time: {result.seconds:.1f} s.",
+            "",
+            *weight_lines,
+            "",
+            "Value reached for each goal:",
+        ])
+        for number, ((name, value, higher_is_better), explanation) in enumerate(zip(goal_values, explanations), start=1):
+            direction = "higher is better" if higher_is_better else "lower is better"
+            summary.extend([f"{number}. {name} ({direction}): {value}", f"   {explanation}"])
+        summary.append("")
     summary.extend([
         "WHERE TO LOOK NEXT",
         "student_schedules.csv gives one row per student. Each slot shows a course and its survey rating.",
         "course_timetable.csv gives one row per course with its time, counts, and student list.",
         "",
-        f"Run settings: {args.seconds_per_stage:g} seconds per round, {args.workers} workers, seed {args.seed}.",
+        f"Method: {args.method}. Run settings: {args.seconds_per_stage:g} seconds "
+        f"{'per round' if args.method == 'cascade' else 'in total'}, {args.workers} workers, seed {args.seed}.",
         f"Course times fixed by staff: {len(locks.course_slots)}",
         f"Student choices required or excluded by staff: {len(locks.student_courses)}",
         f"Class-size cap set by staff: {MAX_CLASS_SIZE if MAX_CLASS_SIZE is not None else 'None'}",
@@ -746,7 +939,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("survey", type=Path, help="Survey file in TXT, TSV, or CSV format")
     parser.add_argument("--out", type=Path, default=Path("schedule_results"), help="New folder for this run")
-    parser.add_argument("--seconds-per-stage", type=float, default=20, help="Search time for each goal")
+    parser.add_argument("--method", choices=("cascade", "weighted"), default=SOLVE_METHOD,
+                        help="cascade: one goal at a time. weighted: one combined score")
+    parser.add_argument("--seconds-per-stage", type=float, default=20,
+                        help="Search time for each goal (cascade) or for the whole search (weighted)")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="Number of solver workers")
     parser.add_argument("--seed", type=int, default=42, help="Number that helps set the search order")
     args = parser.parse_args()
@@ -762,6 +958,12 @@ def main():
             raise ValueError("The seed must be between 0 and 2147483647.")
         if args.out.exists():
             raise ValueError(f"{args.out} already exists. Choose a new --out folder.")
+        if S_POINTS is not None and (type(S_POINTS) is not int or S_POINTS < 1):
+            raise ValueError("S_POINTS must be None or a whole number of at least 1.")
+        if type(L_POINTS) is not int or L_POINTS < 0:
+            raise ValueError("L_POINTS must be a whole number of at least 0.")
+        if args.method == "cascade" and S_POINTS is not None:
+            raise ValueError("The cascade method needs S_POINTS = None.")
 
         courses, students = read_survey(args.survey)
         if len(students) < max(SLOT_SIZES):
@@ -776,9 +978,22 @@ def main():
         if missing_topics:
             print(f"{missing_topics} courses have no topic label. Add known topics in TOPIC_OVERRIDES.", flush=True)
         built = build_model(courses, students, SLOT_SIZES, locks, max_size)
-        solution, rounds = solve_in_priority_order(
-            built, courses, students, SLOT_SIZES, locks, args.seconds_per_stage, args.workers, args.seed,
-        )
+        if args.method == "weighted":
+            ranges = goal_ranges(students, SLOT_SIZES)
+            coefficients = integer_coefficients(built.goals, ranges, GOAL_WEIGHTS, WEIGHT_MULTIPLIER)
+            weight_lines = describe_coefficients(built.goals, ranges, coefficients)
+            print("\n".join(weight_lines), flush=True)
+            solution, rounds = solve_weighted(
+                built, coefficients, args.seconds_per_stage, args.workers, args.seed,
+            )
+        else:
+            weight_lines = None
+            solution, rounds = solve_cascade(
+                built, courses, students, SLOT_SIZES, locks, args.seconds_per_stage, args.workers, args.seed,
+            )
+        goal_values = [
+            (name, solution.value(score), higher_is_better) for name, score, higher_is_better in built.goals
+        ]
 
         # Turn the solver's yes/no answers back into course times and student lists.
         course_times = [solution.value(time) for time in built.course_time]
@@ -794,7 +1009,8 @@ def main():
         with tempfile.TemporaryDirectory(dir=args.out.parent) as temporary:
             folder = Path(temporary) / "results"
             folder.mkdir()
-            write_outputs(folder, args, courses, students, course_times, schedules, locks, rounds)
+            write_outputs(folder, args, courses, students, course_times, schedules, locks, rounds,
+                          goal_values, weight_lines)
             folder.rename(args.out)
     except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"Error: {exc}\n")
