@@ -1,34 +1,3 @@
-#!/usr/bin/env python3
-"""Build course times and student schedules for the MathILy-Er camp.
-
-Run these commands from the folder with this script and the survey.
-
-    python -m pip install ortools==9.15.6755
-    python mathily_er_scheduler_beginner.py survey.txt --out results
-
-The survey has one column per course. The first three rows give the
-instructor, class name, and topic. Every other row gives a student's
-ratings. S means strongly preferred, L means liked, blank means
-acceptable, and X means the student cannot take the course.
-
-Open START_HERE.txt for a summary. The two CSV files show the schedule
-by student and by course. Choose a new output folder for each run.
-
-If you are reading the code for the first time, start at main() at the
-bottom. It follows the same order as a run.
-"""
-
-import argparse
-import csv
-import math
-import os
-import re
-import tempfile
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from functools import cache
-from itertools import combinations
-#!/usr/bin/env python3
 """Build course times and student schedules for the MathILy-Er camp.
 
 Run these commands from the folder with this script and the survey.
@@ -251,7 +220,7 @@ class ScheduleModel:
     goals: list[tuple[str, cp_model.LinearExpr | int, bool]]
 
 
-def build_model(courses, students, slot_sizes, locks, max_class_size):
+def build_model(courses, students, slot_sizes, locks, max_class_size, method):
     model = cp_model.CpModel()
     course_ids = range(len(courses))
     student_ids = range(len(students))
@@ -337,7 +306,7 @@ def build_model(courses, students, slot_sizes, locks, max_class_size):
 
     strong_choices, liked_choices, goals = make_scores(
         model, courses, students, slot_sizes, takes_course, course_at,
-        instructors, topics, max_class_size,
+        instructors, topics, max_class_size, method
     )
     return ScheduleModel(model, takes_course, course_time, strong_choices, liked_choices, goals)
 
@@ -345,7 +314,7 @@ def build_model(courses, students, slot_sizes, locks, max_class_size):
 # 4. Give each legal schedule a set of scores we can compare.
 
 def make_scores(model, courses, students, slot_sizes, takes_course, course_at,
-                instructors, topics, max_class_size):
+                instructors, topics, max_class_size, method):
     course_ids = range(len(courses))
     student_ids = range(len(students))
     slots = range(len(slot_sizes))
@@ -358,7 +327,7 @@ def make_scores(model, courses, students, slot_sizes, takes_course, course_at,
                         if students[s].ratings[c] == "L")
     # By default, with 160 seats, one S is worth 161 points and one L is worth 1.
     # This keeps a single extra S ahead of any possible gain in L.
-    s_points, l_points = preference_points(total_seats)
+    s_points, l_points = preference_points(total_seats, method)
     preference_score = s_points * strong_choices + l_points * liked_choices
 
     group_f = [s for s in student_ids if students[s].gender == "F"]
@@ -430,9 +399,17 @@ def make_scores(model, courses, students, slot_sizes, takes_course, course_at,
 # 4b. Weights and scales. The cascade method uses preference_points and new_solver.
 # The weighted method uses all of these.
 
-def preference_points(total_seats):
+def preference_points(total_seats, method):
     """Points for one S and one L, from the settings at the top."""
-    s_points = total_seats + 1 if S_POINTS is None else S_POINTS
+    #s_points = total_seats + 1 if S_POINTS is None else S_POINTS
+    if(method == "weighted"):
+        if(S_POINTS is None):
+            s_points = 2
+        else:
+            s_points = S_POINTS
+    else: #By default run cascade
+        s_points = total_seats + 1
+
     return s_points, L_POINTS
 
 
@@ -444,7 +421,7 @@ def new_solver(seconds, workers, seed):
     return solver
 
 
-def goal_ranges(students, slot_sizes):
+def goal_ranges(students, slot_sizes, method):
     """The largest value each goal can reach. Every goal's smallest value is 0.
 
     These are safe worst cases, not values a real schedule would get.
@@ -454,7 +431,7 @@ def goal_ranges(students, slot_sizes):
     seats = n * slots
     n_f = sum(student.gender == "F" for student in students)
     n_m = sum(student.gender == "M" for student in students)
-    s_points, l_points = preference_points(seats)
+    s_points, l_points = preference_points(seats, method)
 
     # Worst class sizes: every student in one course of each slot. That course is
     # over its ideal range and the others are under it.
@@ -873,7 +850,7 @@ def write_outputs(folder, args, courses, students, course_times, schedules, lock
         "The ideal range rounds the average class size in that slot down and up.",
         "",
     ])
-    s_points, l_points = preference_points(total_seats)
+    s_points, l_points = preference_points(total_seats, args.method)
     explanations = [
         "More S choices first. More L choices break ties." if weight_lines is None
         else f"Each S choice earns {s_points} points and each L choice earns {l_points}.",
@@ -944,7 +921,7 @@ def main():
     parser.add_argument("--seconds-per-stage", type=float, default=20,
                         help="Search time for each goal (cascade) or for the whole search (weighted)")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1), help="Number of solver workers")
-    parser.add_argument("--seed", type=int, default=42, help="Number that helps set the search order")
+    parser.add_argument("--seed", type=int, default=67, help="Number that helps set the search order")
     args = parser.parse_args()
     started = perf_counter()
     try:
@@ -977,9 +954,9 @@ def main():
         missing_topics = sum(not course.topic for course in courses)
         if missing_topics:
             print(f"{missing_topics} courses have no topic label. Add known topics in TOPIC_OVERRIDES.", flush=True)
-        built = build_model(courses, students, SLOT_SIZES, locks, max_size)
+        built = build_model(courses, students, SLOT_SIZES, locks, max_size, args.method)
         if args.method == "weighted":
-            ranges = goal_ranges(students, SLOT_SIZES)
+            ranges = goal_ranges(students, SLOT_SIZES, "weighted")
             coefficients = integer_coefficients(built.goals, ranges, GOAL_WEIGHTS, WEIGHT_MULTIPLIER)
             weight_lines = describe_coefficients(built.goals, ranges, coefficients)
             print("\n".join(weight_lines), flush=True)
